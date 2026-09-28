@@ -1,0 +1,8 @@
+/target
+**/*.rs.bk
+Cargo.lock.bak
+.env
+**/__pycache__/
+/crates/private-data-vault-py/python/private_data_vault/*.pyd
+/crates/private-data-vault-py/python/private_data_vault/*.pdb
+/crates/private-data-vault-py/python/private_data_vault/*.so

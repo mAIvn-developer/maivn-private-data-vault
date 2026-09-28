@@ -1,0 +1,9 @@
+mAIvn Private Data Vault Python Bindings
+Copyright 2024-2026 mAIvn, LLC
+https://maivn.io
+mAIvn licensing revision: 1.1 (2026-09-21).
+
+Third-party license and attribution material for the compiled Rust dependencies is in
+private_data_vault/THIRD_PARTY_NOTICES. The unmodified MPL-2.0 source for
+option-ext 0.2.0 accompanies this wheel at
+private_data_vault/_third_party/option_ext_0_2_0/.
