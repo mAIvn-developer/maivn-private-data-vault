@@ -41,12 +41,36 @@ jobs:
       - name: Build wheel
         run: uvx --from "maturin>=1.8,<2.0" maturin build --release --out dist
         working-directory: crates/private-data-vault-py
+      - name: Prepare private Windows test temp directory
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $testTemp = Join-Path $env:RUNNER_TEMP 'private-data-vault-tests'
+          New-Item -ItemType Directory -Path $testTemp -Force | Out-Null
+          $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+          $acl = [System.Security.AccessControl.DirectorySecurity]::new()
+          $acl.SetAccessRuleProtection($true, $false)
+          $inheritance = [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor
+            [System.Security.AccessControl.InheritanceFlags]::ObjectInherit
+          $rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
+            $identity,
+            [System.Security.AccessControl.FileSystemRights]::FullControl,
+            $inheritance,
+            [System.Security.AccessControl.PropagationFlags]::None,
+            [System.Security.AccessControl.AccessControlType]::Allow
+          )
+          $acl.AddAccessRule($rule)
+          Set-Acl -LiteralPath $testTemp -AclObject $acl
+          "MAIVN_VAULT_TEST_TEMP=$testTemp" >> $env:GITHUB_ENV
       - name: Install wheel and run the crate tests
         shell: bash
         run: |
           uv venv .ci --python ${{ matrix.python-version }}
           PY=.ci/bin/python; [ -x "$PY" ] || PY=.ci/Scripts/python.exe
           uv pip install --python "$PY" --find-links crates/private-data-vault-py/dist private-data-vault pytest
+          if [ "$RUNNER_OS" = Windows ]; then
+            export TMPDIR="$MAIVN_VAULT_TEST_TEMP" TEMP="$MAIVN_VAULT_TEST_TEMP" TMP="$MAIVN_VAULT_TEST_TEMP"
+          fi
           "$PY" -m pytest crates/private-data-vault-py/tests -q
       - name: Cargo tests
         run: cargo test --workspace --release
