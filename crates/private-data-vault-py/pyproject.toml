@@ -1,0 +1,49 @@
+[build-system]
+requires = ["maturin>=1.8,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "private-data-vault"
+dynamic = ["version"]
+requires-python = ">=3.10"
+description = "Sealed storage for private documents and the values redacted out of them."
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Topic :: Security :: Cryptography",
+]
+
+[dependency-groups]
+dev = [
+    "basedpyright==1.39.9",
+    "pytest==9.1.1",
+    "ruff==0.16.1",
+]
+
+[tool.maturin]
+# maturin reads its configuration from HERE, not from [package.metadata.maturin]
+# in Cargo.toml -- an earlier attempt put it there and the stubs were silently
+# left out of the wheel, which is exactly the failure mode where a build
+# succeeds and the thing you wanted is missing.
+python-source = "python"
+module-name = "private_data_vault.private_data_vault"
+features = ["pyo3/extension-module"]
+include = [
+    { path = "THIRD_PARTY_NOTICES", format = ["sdist", "wheel"] },
+]
+
+[tool.ruff.format]
+# LF on every platform. The default, "auto", keeps whatever ending a file
+# already carries, which is how CRLF kept arriving from Windows editors.
+line-ending = "lf"
+
+[tool.basedpyright]
+include = [
+    "python/private_data_vault/__init__.pyi",
+    "tests/typecheck_api.py",
+]
+typeCheckingMode = "strict"
+reportUnnecessaryTypeIgnoreComment = "error"

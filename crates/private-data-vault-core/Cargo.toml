@@ -1,0 +1,25 @@
+[package]
+name = "private-data-vault-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+argon2 = { version = "0.5.3", features = ["zeroize"] }
+chacha20poly1305 = "0.10.1"
+fs2 = "0.4.3"
+hex = "0.4.3"
+hmac = "0.12.1"
+rand_core = { version = "0.6.4", features = ["getrandom"] }
+serde_json = "1.0.140"
+sha2 = "0.10.9"
+thiserror = "2.0.12"
+zeroize = "1.8.1"
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+filetime = "0.2.25"
+tempfile = "3.20.0"

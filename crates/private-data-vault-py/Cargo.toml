@@ -1,0 +1,33 @@
+[package]
+name = "private-data-vault-py"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "private_data_vault"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+directories = "6.0.0"
+fs2 = "0.4.3"
+hex = "0.4.3"
+keyring = "4.2.0"
+private-data-vault-core = { path = "../private-data-vault-core" }
+pyo3 = { version = "=0.29.2", features = ["abi3-py310", "extension-module"] }
+rand_core = { version = "0.6.4", features = ["getrandom"] }
+serde = "1.0.219"
+serde_json = "1.0.140"
+sha2 = "0.10.9"
+zeroize = "1.8.1"
+
+[dev-dependencies]
+tempfile = "3.20.0"
+
+[target.'cfg(windows)'.dependencies]
+winapi = "0.3.9"
+windows-acl = "0.3.0"
+
+[lints]
+workspace = true

@@ -1,0 +1,52 @@
+name: CI
+
+# Builds the extension wheel on Linux and Windows and runs the Python crate's
+# tests against the installed wheel, the way a user receives it.
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: private-data-vault-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  wheel-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.10", "3.12"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable, 2026-09-03
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      - name: Release guard self-test (offline)
+        run: uv run --with packaging --no-project --python 3.12 python scripts/release_guard_test.py
+
+      - name: Build wheel
+        run: uvx --from "maturin>=1.8,<2.0" maturin build --release --out dist
+        working-directory: crates/private-data-vault-py
+      - name: Install wheel and run the crate tests
+        shell: bash
+        run: |
+          uv venv .ci --python ${{ matrix.python-version }}
+          PY=.ci/bin/python; [ -x "$PY" ] || PY=.ci/Scripts/python.exe
+          uv pip install --python "$PY" --find-links crates/private-data-vault-py/dist private-data-vault pytest
+          "$PY" -m pytest crates/private-data-vault-py/tests -q
+      - name: Cargo tests
+        run: cargo test --workspace --release
