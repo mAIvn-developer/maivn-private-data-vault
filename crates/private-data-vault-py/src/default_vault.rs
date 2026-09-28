@@ -429,7 +429,7 @@ fn restrict_windows_directory(path: &Path) -> Result<(), AdapterError> {
     use winapi::um::winnt::{CONTAINER_INHERIT_ACE, FILE_ALL_ACCESS, OBJECT_INHERIT_ACE};
     use windows_acl::{
         acl::{ACL, AceType},
-        helper::{current_user, name_to_sid, sid_to_string},
+        helper::{current_user, name_to_sid, sid_to_string, string_to_sid},
     };
 
     let user = current_user().ok_or_else(|| {
@@ -468,11 +468,37 @@ fn restrict_windows_directory(path: &Path) -> Result<(), AdapterError> {
     let path_text = path.to_str().ok_or_else(|| {
         AdapterError::StorageUnavailable("the vault path is not valid Unicode".to_owned())
     })?;
-    let acl = ACL::from_file_path(path_text, false).map_err(|_| {
+    let mut acl = ACL::from_file_path(path_text, false).map_err(|_| {
         AdapterError::StorageUnavailable(
             "the vault directory permissions could not be verified".to_owned(),
         )
     })?;
+    // icacls removes inherited grants but preserves other explicit identities.
+    // Windows temporary directories can carry explicit SYSTEM, Administrators,
+    // and OWNER RIGHTS entries even under a private parent directory.
+    let restriction_failed = || {
+        AdapterError::StorageUnavailable(
+            "the vault directory permissions could not be restricted".to_owned(),
+        )
+    };
+    for entry in acl.all().map_err(|_| restriction_failed())? {
+        if !matches!(entry.entry_type, AceType::AccessAllow | AceType::AccessDeny) {
+            return Err(restriction_failed());
+        }
+        if !entry.string_sid.eq_ignore_ascii_case(&user_sid) {
+            let other_sid = string_to_sid(&entry.string_sid).map_err(|_| restriction_failed())?;
+            let removed = acl
+                .remove(
+                    other_sid.as_ptr().cast_mut().cast(),
+                    Some(entry.entry_type),
+                    None,
+                )
+                .map_err(|_| restriction_failed())?;
+            if removed == 0 {
+                return Err(restriction_failed());
+            }
+        }
+    }
     let entries = acl.all().map_err(|_| {
         AdapterError::StorageUnavailable(
             "the vault directory permissions could not be verified".to_owned(),
@@ -481,18 +507,19 @@ fn restrict_windows_directory(path: &Path) -> Result<(), AdapterError> {
     let inherit_flags = CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE;
     let mut full_control = false;
     for entry in entries {
-        if matches!(entry.entry_type, AceType::AccessAllow | AceType::AccessDeny) {
-            if !entry.string_sid.eq_ignore_ascii_case(&user_sid) {
-                return Err(AdapterError::StorageUnavailable(
-                    "the vault directory grants access to another Windows identity".to_owned(),
-                ));
-            }
-            if entry.entry_type == AceType::AccessAllow
-                && entry.mask & FILE_ALL_ACCESS == FILE_ALL_ACCESS
-                && entry.flags & inherit_flags == inherit_flags
-            {
-                full_control = true;
-            }
+        if !matches!(entry.entry_type, AceType::AccessAllow | AceType::AccessDeny) {
+            return Err(restriction_failed());
+        }
+        if !entry.string_sid.eq_ignore_ascii_case(&user_sid) {
+            return Err(AdapterError::StorageUnavailable(
+                "the vault directory grants access to another Windows identity".to_owned(),
+            ));
+        }
+        if entry.entry_type == AceType::AccessAllow
+            && entry.mask & FILE_ALL_ACCESS == FILE_ALL_ACCESS
+            && entry.flags & inherit_flags == inherit_flags
+        {
+            full_control = true;
         }
     }
     if !full_control {
@@ -522,6 +549,46 @@ mod tests {
     use crate::AdapterError;
 
     const EXPLICIT_SECRET: &[u8; 32] = b"0123456789abcdef0123456789abcdef";
+
+    #[cfg(windows)]
+    #[test]
+    fn explicit_windows_grants_are_removed_before_the_directory_is_used() {
+        use winapi::um::winnt::FILE_GENERIC_READ;
+        use windows_acl::{
+            acl::{ACL, AceType},
+            helper::{current_user, name_to_sid, sid_to_string, string_to_sid},
+        };
+
+        let base = tempdir().expect("base directory");
+        let vault = base.path().join("vault");
+        std::fs::create_dir(&vault).expect("vault directory");
+        let path = vault.to_str().expect("Unicode test path");
+        let mut acl = ACL::from_file_path(path, false).expect("directory ACL");
+        let everyone_sid = string_to_sid("S-1-1-0").expect("Everyone SID");
+        acl.allow(
+            everyone_sid.as_ptr().cast_mut().cast(),
+            true,
+            FILE_GENERIC_READ,
+        )
+        .expect("temporary test grant");
+        assert!(acl.all().expect("test ACL").iter().any(|entry| {
+            entry.entry_type == AceType::AccessAllow && entry.string_sid == "S-1-1-0"
+        }));
+
+        super::restrict_windows_directory(&vault).expect("private vault directory");
+
+        let user = current_user().expect("current user");
+        let user_sid = name_to_sid(&user, None).expect("current user SID");
+        let user_sid = sid_to_string(user_sid.as_ptr().cast_mut().cast()).expect("SID string");
+        let entries = ACL::from_file_path(path, false)
+            .expect("restricted directory ACL")
+            .all()
+            .expect("restricted entries");
+        assert!(entries.iter().all(|entry| {
+            matches!(entry.entry_type, AceType::AccessAllow | AceType::AccessDeny)
+                && entry.string_sid.eq_ignore_ascii_case(&user_sid)
+        }));
+    }
 
     #[derive(Default)]
     struct FakeCredentialStore {
