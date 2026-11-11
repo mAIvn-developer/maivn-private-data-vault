@@ -39,7 +39,7 @@ jobs:
         run: uv run --with packaging --no-project --python 3.12 python scripts/release_guard_test.py
 
       - name: Build wheel
-        run: uvx --from "maturin>=1.8,<2.0" maturin build --release --out dist
+        run: uvx --from "maturin>=1.8,<2.0" maturin build --locked --release --out dist
         working-directory: crates/private-data-vault-py
       - name: Prepare private Windows test temp directory
         if: runner.os == 'Windows'

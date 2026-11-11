@@ -7,6 +7,9 @@
 
 #![doc(html_no_source)]
 
+pub mod artifact_chunk;
+pub mod artifact_frame;
+pub mod artifact_integrity;
 mod error;
 mod identity;
 mod key;
@@ -14,6 +17,7 @@ mod keyring;
 mod local;
 mod memory;
 mod reencrypt;
+pub mod software_kms;
 mod storage;
 mod vault;
 

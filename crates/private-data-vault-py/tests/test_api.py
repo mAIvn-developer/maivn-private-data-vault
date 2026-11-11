@@ -1,3 +1,4 @@
+import ast
 import importlib
 import inspect
 import json
@@ -308,6 +309,114 @@ class PublicApiTests(unittest.TestCase):
                     vault.purge_expired(invalid_age)
             with self.assertRaises(TypeError):
                 vault.store_original("tenant", "record", "not bytes")
+
+    def test_the_type_stub_describes_exactly_the_compiled_surface(self) -> None:
+        stub_path = Path(self.module.__file__).with_name("__init__.pyi")
+        stub = ast.parse(stub_path.read_text(encoding="utf-8"))
+        stubbed = {
+            node.name: {
+                item.name
+                for item in node.body
+                if isinstance(item, ast.FunctionDef) and not item.name.startswith("_")
+            }
+            for node in stub.body
+            if isinstance(node, ast.ClassDef)
+        }
+        functions = {
+            node.name for node in stub.body if isinstance(node, ast.FunctionDef)
+        }
+        self.assertEqual(set(stubbed) | functions, set(self.module.__all__))
+        for name in functions:
+            self.assertTrue(inspect.isbuiltin(getattr(self.module, name)), name)
+        for name, stubbed_methods in stubbed.items():
+            compiled_class = getattr(self.module, name)
+            self.assertTrue(inspect.isclass(compiled_class), name)
+            if issubclass(compiled_class, Exception):
+                continue
+            compiled = {
+                attribute
+                for attribute in vars(compiled_class)
+                if not attribute.startswith("_")
+            }
+            self.assertEqual(stubbed_methods, compiled, name)
+        for name in (
+            "RecordNotFound",
+            "AuthenticationFailed",
+            "RollbackDetected",
+            "StorageUnavailable",
+        ):
+            self.assertTrue(
+                issubclass(getattr(self.module, name), self.module.VaultError), name
+            )
+
+    def test_replace_record_needs_an_existing_record(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            vault = self.module.LocalVault(directory, b"secret")
+            with self.assertRaises(self.module.RecordNotFound):
+                vault.replace_record("tenant", "record", b"o", b"d", b"{}")
+            vault.store_record("tenant", "record", b"o1", b"d1", b'{"a":"1"}')
+            vault.replace_record("tenant", "record", b"o2", b"d2", b'{"a":"2"}')
+            self.assertEqual(vault.load_original("tenant", "record"), b"o2")
+            self.assertEqual(vault.load_document("tenant", "record"), b"d2")
+            self.assertEqual(vault.load_value_map("tenant", "record"), b'{"a":"2"}')
+
+    def test_purge_expired_sweeps_by_age_and_refuses_an_age_before_the_epoch(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            vault = self.module.LocalVault(directory, b"secret")
+            vault.store_record("tenant", "record", b"o", b"d", b"{}")
+            self.assertEqual(vault.purge_expired(3600), 0)
+            with self.assertRaisesRegex(
+                self.module.VaultError, "further back than the epoch"
+            ):
+                vault.purge_expired(2**64 - 1)
+            with self.assertRaises(OverflowError):
+                vault.purge_expired(2**64)
+            with self.assertRaises(OverflowError):
+                vault.purge_expired(-1)
+
+    def test_value_maps_must_be_json_objects_of_strings(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            vault = self.module.LocalVault(directory, b"secret")
+            for payload in (b"[]", b'"text"', b'{"a":1}', b'{"a":null}'):
+                with (
+                    self.subTest(payload=payload),
+                    self.assertRaisesRegex(
+                        self.module.VaultError, "JSON object|string"
+                    ),
+                ):
+                    vault.store_value_map("tenant", "record", payload)
+
+    def test_decrypt_only_secrets_must_be_exactly_bytes(self) -> None:
+        class SecretBytes(bytes):
+            pass
+
+        with tempfile.TemporaryDirectory() as directory, self.assertRaises(TypeError):
+            self.module.LocalVault(
+                directory,
+                b"secret",
+                key_version=2,
+                decrypt_only={1: SecretBytes(b"old")},
+            )
+
+    def test_decrypt_only_versions_must_fit_32_bits(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            for version in (2**32, -1):
+                with self.subTest(version=version), self.assertRaises(TypeError):
+                    self.module.LocalVault(
+                        directory,
+                        b"secret",
+                        key_version=1,
+                        decrypt_only={version: b"old"},
+                    )
+
+    def test_unreachable_storage_is_storage_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            blocker = Path(directory, "not-a-directory")
+            blocker.write_bytes(b"file")
+            with self.assertRaises(self.module.StorageUnavailable):
+                self.module.LocalVault(str(blocker), b"secret")
 
 
 if __name__ == "__main__":

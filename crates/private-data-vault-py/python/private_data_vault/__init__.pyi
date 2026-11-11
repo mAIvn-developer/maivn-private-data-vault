@@ -9,6 +9,48 @@ out, and a distinct exception per failure mode. If this file and the Rust ever
 disagree, the Rust is right and this is a bug.
 """
 
+from collections.abc import Sequence
+from typing import overload
+
+class ArtifactChunkCipher:
+    def __init__(self, salt: bytes, secret: bytes) -> None: ...
+    def seal(self, aad: bytes, plaintext: bytes) -> tuple[bytes, str]: ...
+    def open(self, aad: bytes, ciphertext: bytes) -> bytes: ...
+
+class ArtifactSha256:
+    def __init__(self) -> None: ...
+    def update(self, input: object) -> None: ...
+    def hexdigest(self) -> str: ...
+
+class ArtifactIntakeCommitment:
+    def __init__(self, key: bytes, prefix: bytes) -> None: ...
+    def update(self, input: object) -> None: ...
+    def verify(self, expected: str) -> bool: ...
+    def discard(self) -> None: ...
+
+def artifact_sha256_hex(input: object) -> str: ...
+
+class SoftwareKmsCipher:
+    def __init__(self, root: bytes) -> None: ...
+    def wrap_key(self, nonce_bytes: bytes, key: bytes, aad: bytes) -> bytes: ...
+    def unwrap_key(
+        self,
+        nonce_bytes: bytes,
+        wrapped: bytes,
+        aad: bytes,
+        invalid_tag: type[Exception],
+    ) -> bytes | None: ...
+
+def pack_artifact_frame(
+    counter: bytes, parts: Sequence[bytes | bytearray]
+) -> bytes: ...
+@overload
+def unpack_artifact_frame(blob: bytes) -> tuple[int, tuple[bytes, ...]] | None: ...
+@overload
+def unpack_artifact_frame(
+    blob: bytearray,
+) -> tuple[int, tuple[bytearray, ...]] | None: ...
+
 class VaultError(Exception):
     """Base class for every vault failure."""
 
@@ -186,7 +228,10 @@ class ExchangeVault:
         document: bytes,
         value_map: bytes,
     ) -> None:
-        """Hydrate one record's sealed state exactly as previously exported."""
+        """Hydrate one record's sealed state exactly as previously exported.
+
+        Raises VaultError for generation 0, which no sealed record carries.
+        """
 
     def load_document(self, tenant: str, record: str) -> bytes:
         """Open the hydrated redacted document."""

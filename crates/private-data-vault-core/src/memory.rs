@@ -33,7 +33,7 @@ use std::{
 use rand_core::{OsRng, RngCore};
 
 use crate::{
-    ContentKind, RecordIdentity, StorageError,
+    ContentKind, RecordIdentity, StorageError, VaultError,
     storage::{GenerationRead, GenerationTransaction, PendingDocument, PurgeKeys, StorageBackend},
 };
 
@@ -106,10 +106,24 @@ impl MemoryBackend {
     }
 
     /// Seeds one record's trusted generation, as read from durable metadata.
-    pub fn hydrate_generation(&self, record_key: [u8; 32], generation: u64) {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VaultError::InvalidFormat`] for generation 0. No sealed record
+    /// carries it, and a version-1 object parses with generation 0, so trusting
+    /// it would let such an object pass the rollback check.
+    pub fn hydrate_generation(
+        &self,
+        record_key: [u8; 32],
+        generation: u64,
+    ) -> Result<(), VaultError> {
+        if generation == 0 {
+            return Err(VaultError::InvalidFormat);
+        }
         lock(&self.shared)
             .generations
             .insert(record_key, generation);
+        Ok(())
     }
 
     /// Seeds one sealed object exactly as it was previously extracted.
@@ -173,8 +187,17 @@ impl MemoryBackend {
     }
 
     /// Seeds one record's complete sealed state exactly as it was exported.
-    pub fn import_record(&self, identity: &RecordIdentity, record: &ExchangeRecord) {
-        self.hydrate_generation(identity.record_key(), record.generation);
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VaultError::InvalidFormat`] for generation 0, before anything
+    /// is stored.
+    pub fn import_record(
+        &self,
+        identity: &RecordIdentity,
+        record: &ExchangeRecord,
+    ) -> Result<(), VaultError> {
+        self.hydrate_generation(identity.record_key(), record.generation)?;
         let place = |kind: ContentKind, sealed: &Vec<u8>| {
             self.hydrate_object(
                 identity.versioned_storage_key(kind),
@@ -186,6 +209,7 @@ impl MemoryBackend {
         place(ContentKind::Original, &record.original);
         place(ContentKind::Document, &record.document);
         place(ContentKind::ValueMap, &record.value_map);
+        Ok(())
     }
 }
 

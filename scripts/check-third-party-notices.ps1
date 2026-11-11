@@ -16,8 +16,8 @@ function Test-RustStandardLibraryMaterials {
     $expected = @{ $apache[0].FullName = 'a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2'; $mit[0].FullName = '23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3'; $copyright = '0a65bb747c49c7bb816cbc7188319bd6e4e8d08091c1190b8a3c0971c47968ed' }
     foreach ($path in $expected.Keys) { if ((Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expected[$path]) { throw "Rust standard-library material changed: $path" } }
 }
-$expectedLock = 'b30ee70f528dd35ebf5d70ceb89d8441bec1e6d86a4a64d294eba9705ccab550'
-$expectedClosure = 'e722dc370264309d8b220880da9fad4b5896aad5ed58a7b07fe1a72bfc39b983'
+$expectedLock = '7bd71899e1529d48017a096c90e00bea04fd310a7842b3f6448c4a034ce96401'
+$expectedClosure = '0b3e5c53ac13934bdedb16ad0f732c714ebf7401763a3daad502c3506b67853c'
 if ((Get-FileHash (Join-Path $vaultRoot 'Cargo.lock') -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expectedLock) { throw 'Cargo.lock changed; regenerate and review THIRD_PARTY_NOTICES.' }
 Push-Location $vaultRoot
 try {

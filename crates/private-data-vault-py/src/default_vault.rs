@@ -429,12 +429,20 @@ fn restrict_windows_directory(path: &Path) -> Result<(), AdapterError> {
     use winapi::um::winnt::{CONTAINER_INHERIT_ACE, FILE_ALL_ACCESS, OBJECT_INHERIT_ACE};
     use windows_acl::{
         acl::{ACL, AceType},
-        helper::{current_user, name_to_sid, sid_to_string, string_to_sid},
+        helper::string_to_sid,
     };
 
-    let user = current_user().ok_or_else(|| {
-        AdapterError::StorageUnavailable("the current Windows identity is unavailable".to_owned())
+    let (user, user_sid) = current_windows_identity()?;
+    let path_text = path.to_str().ok_or_else(|| {
+        AdapterError::StorageUnavailable("the vault path is not valid Unicode".to_owned())
     })?;
+    // A directory an earlier open already restricted is left alone. icacls
+    // with an inheritable grant rewrites every file beneath the directory, so
+    // running it on each open cost time in proportion to the vault's size:
+    // 4.5 s for 13,423 records (October 2026).
+    if windows_directory_is_private(path_text, &user_sid)? {
+        return Ok(());
+    }
     let system_root = std::env::var_os("SystemRoot").ok_or_else(|| {
         AdapterError::StorageUnavailable("the Windows system directory is unavailable".to_owned())
     })?;
@@ -459,15 +467,6 @@ fn restrict_windows_directory(path: &Path) -> Result<(), AdapterError> {
         ));
     }
 
-    let user_sid = name_to_sid(&user, None).map_err(|_| {
-        AdapterError::StorageUnavailable("the current Windows identity is unavailable".to_owned())
-    })?;
-    let user_sid = sid_to_string(user_sid.as_ptr().cast_mut().cast()).map_err(|_| {
-        AdapterError::StorageUnavailable("the current Windows identity is unavailable".to_owned())
-    })?;
-    let path_text = path.to_str().ok_or_else(|| {
-        AdapterError::StorageUnavailable("the vault path is not valid Unicode".to_owned())
-    })?;
     let mut acl = ACL::from_file_path(path_text, false).map_err(|_| {
         AdapterError::StorageUnavailable(
             "the vault directory permissions could not be verified".to_owned(),
@@ -531,6 +530,57 @@ fn restrict_windows_directory(path: &Path) -> Result<(), AdapterError> {
     Ok(())
 }
 
+/// The current Windows account name, for icacls, and its SID string, for
+/// comparing ACL entries.
+#[cfg(windows)]
+fn current_windows_identity() -> Result<(String, String), AdapterError> {
+    use windows_acl::helper::{current_user, name_to_sid, sid_to_string};
+
+    let unavailable = || {
+        AdapterError::StorageUnavailable("the current Windows identity is unavailable".to_owned())
+    };
+    let user = current_user().ok_or_else(unavailable)?;
+    let sid = name_to_sid(&user, None).map_err(|_| unavailable())?;
+    let sid = sid_to_string(sid.as_ptr().cast_mut().cast()).map_err(|_| unavailable())?;
+    Ok((user, sid))
+}
+
+/// Whether the directory is already exactly what `restrict_windows_directory`
+/// leaves: only explicit allow entries for the current identity (icacls
+/// `/inheritance:r` turns inherited entries explicit, so an inherited one
+/// means the directory still follows its parent), one of them inheritable
+/// full control. Anything else, a deny entry included, takes the full path.
+#[cfg(windows)]
+fn windows_directory_is_private(path_text: &str, user_sid: &str) -> Result<bool, AdapterError> {
+    use winapi::um::winnt::{
+        CONTAINER_INHERIT_ACE, FILE_ALL_ACCESS, INHERITED_ACE, OBJECT_INHERIT_ACE,
+    };
+    use windows_acl::acl::{ACL, AceType};
+
+    let unverifiable = || {
+        AdapterError::StorageUnavailable(
+            "the vault directory permissions could not be verified".to_owned(),
+        )
+    };
+    let acl = ACL::from_file_path(path_text, false).map_err(|_| unverifiable())?;
+    let inherit_flags = CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE;
+    let mut full_control = false;
+    for entry in acl.all().map_err(|_| unverifiable())? {
+        if entry.entry_type != AceType::AccessAllow
+            || entry.flags & INHERITED_ACE != 0
+            || !entry.string_sid.eq_ignore_ascii_case(user_sid)
+        {
+            return Ok(false);
+        }
+        if entry.mask & FILE_ALL_ACCESS == FILE_ALL_ACCESS
+            && entry.flags & inherit_flags == inherit_flags
+        {
+            full_control = true;
+        }
+    }
+    Ok(full_control)
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -590,11 +640,52 @@ mod tests {
         }));
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn an_already_private_directory_is_recognized_and_a_loosened_one_is_restricted_again() {
+        use winapi::um::winnt::FILE_GENERIC_READ;
+        use windows_acl::{
+            acl::ACL,
+            helper::{current_user, name_to_sid, sid_to_string, string_to_sid},
+        };
+
+        let base = tempdir().expect("base directory");
+        let vault = base.path().join("vault");
+        std::fs::create_dir(&vault).expect("vault directory");
+        let path = vault.to_str().expect("Unicode test path");
+        let user = current_user().expect("current user");
+        let user_sid = name_to_sid(&user, None).expect("current user SID");
+        let user_sid = sid_to_string(user_sid.as_ptr().cast_mut().cast()).expect("SID string");
+        let is_private = || super::windows_directory_is_private(path, &user_sid).expect("check");
+
+        // A fresh directory still follows its parent's inherited grants.
+        assert!(!is_private());
+        super::restrict_windows_directory(&vault).expect("private vault directory");
+        assert!(is_private());
+        // The next open finds it private and leaves it so.
+        super::restrict_windows_directory(&vault).expect("still private");
+        assert!(is_private());
+
+        // Loosened afterwards, it is no longer private, and an open restores it.
+        let mut acl = ACL::from_file_path(path, false).expect("directory ACL");
+        let everyone_sid = string_to_sid("S-1-1-0").expect("Everyone SID");
+        acl.allow(
+            everyone_sid.as_ptr().cast_mut().cast(),
+            true,
+            FILE_GENERIC_READ,
+        )
+        .expect("temporary test grant");
+        assert!(!is_private());
+        super::restrict_windows_directory(&vault).expect("restricted again");
+        assert!(is_private());
+    }
+
     #[derive(Default)]
     struct FakeCredentialStore {
         secrets: Mutex<BTreeMap<String, Vec<u8>>>,
         writes: Mutex<usize>,
         unavailable: bool,
+        read_only: bool,
     }
 
     impl CredentialStore for FakeCredentialStore {
@@ -612,7 +703,7 @@ mod tests {
         }
 
         fn set(&self, account: &str, secret: &[u8]) -> Result<(), DefaultVaultError> {
-            if self.unavailable {
+            if self.unavailable || self.read_only {
                 return Err(DefaultVaultError::CredentialUnavailable);
             }
             self.secrets
@@ -928,6 +1019,199 @@ mod tests {
         );
     }
 
+    fn unavailable(result: Result<crate::VaultAdapter, AdapterError>) -> String {
+        match result {
+            Err(AdapterError::StorageUnavailable(message)) => message,
+            Err(other) => panic!("expected StorageUnavailable, got {other:?}"),
+            Ok(_) => panic!("expected StorageUnavailable, the vault opened"),
+        }
+    }
+
+    #[test]
+    fn an_empty_scope_is_refused() {
+        let base = tempdir().expect("base directory");
+        assert!(matches!(
+            open_default_with_store("", None, None, base.path(), &FakeCredentialStore::default()),
+            Err(AdapterError::Vault(message)) if message == "vault scope must not be empty"
+        ));
+    }
+
+    #[test]
+    fn a_stored_credential_of_the_wrong_length_fails_closed() {
+        let base = tempdir().expect("base directory");
+        let store = FakeCredentialStore::default();
+        open_default_with_store("scope-a", None, None, base.path(), &store)
+            .expect("default vault opens");
+        for secret in store.secrets.lock().expect("fake store lock").values_mut() {
+            secret.truncate(16);
+        }
+
+        assert_eq!(
+            unavailable(open_default_with_store(
+                "scope-a",
+                None,
+                None,
+                base.path(),
+                &store
+            )),
+            "vault credential is unavailable"
+        );
+    }
+
+    #[test]
+    fn a_credential_store_that_refuses_the_first_write_creates_nothing_usable() {
+        let base = tempdir().expect("base directory");
+        let store = FakeCredentialStore {
+            read_only: true,
+            ..FakeCredentialStore::default()
+        };
+
+        assert_eq!(
+            unavailable(open_default_with_store(
+                "scope-a",
+                None,
+                None,
+                base.path(),
+                &store
+            )),
+            "operating-system credential store is unavailable"
+        );
+        let root = super::scoped_path(base.path(), "scope-a");
+        assert!(!root.join(super::STATE_FILE).exists());
+        assert!(!root.join(super::INITIALIZED_FILE).exists());
+    }
+
+    #[test]
+    fn a_scope_marker_for_another_scope_is_refused() {
+        let base = tempdir().expect("base directory");
+        let store = FakeCredentialStore::default();
+        open_default_with_store("scope-a", None, None, base.path(), &store)
+            .expect("default vault opens");
+        let root = super::scoped_path(base.path(), "scope-a");
+        std::fs::write(
+            root.join(super::SCOPE_FILE),
+            super::scope_identifier("scope-b"),
+        )
+        .expect("scope marker rewrites");
+
+        assert_eq!(
+            unavailable(open_default_with_store(
+                "scope-a",
+                None,
+                None,
+                base.path(),
+                &store
+            )),
+            "vault scope does not match the existing storage"
+        );
+    }
+
+    #[test]
+    fn records_without_state_or_marker_still_block_reinitialization() {
+        let base = tempdir().expect("base directory");
+        let store = FakeCredentialStore::default();
+        let root = super::scoped_path(base.path(), "scope-a");
+        std::fs::create_dir_all(root.join("values")).expect("values directory");
+        std::fs::write(root.join("values").join("orphan.pvm"), b"sealed").expect("record");
+
+        assert_eq!(
+            unavailable(open_default_with_store(
+                "scope-a",
+                None,
+                None,
+                base.path(),
+                &store
+            )),
+            "vault state is unavailable"
+        );
+        assert_eq!(*store.writes.lock().expect("fake write lock"), 0);
+    }
+
+    #[test]
+    fn an_initialized_marker_without_state_blocks_reinitialization() {
+        let base = tempdir().expect("base directory");
+        let store = FakeCredentialStore::default();
+        let root = super::scoped_path(base.path(), "scope-a");
+        std::fs::create_dir_all(&root).expect("scope directory");
+        std::fs::write(root.join(super::INITIALIZED_FILE), b"1").expect("marker");
+
+        assert_eq!(
+            unavailable(open_default_with_store(
+                "scope-a",
+                None,
+                None,
+                base.path(),
+                &store
+            )),
+            "vault state is unavailable"
+        );
+        assert!(!root.join(super::STATE_FILE).exists());
+    }
+
+    #[test]
+    fn metadata_paths_that_are_directories_fail_closed() {
+        for (path, expected) in [
+            (super::STATE_FILE, "vault state is unavailable"),
+            (
+                super::INITIALIZED_FILE,
+                "vault initialization metadata is unavailable",
+            ),
+            (super::SCOPE_FILE, "vault storage is unavailable"),
+        ] {
+            let base = tempdir().expect("base directory");
+            let root = super::scoped_path(base.path(), "scope-a");
+            std::fs::create_dir_all(root.join(path)).expect("blocking directory");
+
+            let message = unavailable(open_default_with_store(
+                "scope-a",
+                Some(base.path()),
+                Some(EXPLICIT_SECRET),
+                Path::new(""),
+                &FakeCredentialStore::default(),
+            ));
+            assert!(message.starts_with(expected), "{path}: {message}");
+        }
+    }
+
+    #[test]
+    fn existence_checks_refuse_relative_parents_and_ignore_foreign_directories() {
+        let base = tempdir().expect("base directory");
+        assert!(matches!(
+            default_exists_with_base(None, Some(Path::new("relative")), base.path()),
+            Err(AdapterError::Vault(message)) if message.contains("absolute")
+        ));
+
+        std::fs::create_dir(base.path().join("unrelated")).expect("foreign directory");
+        std::fs::write(base.path().join("loose-file"), b"x").expect("foreign file");
+        assert!(!default_exists_with_base(None, None, base.path()).expect("root checks"));
+
+        let file_base = base.path().join("loose-file");
+        assert!(matches!(
+            default_exists_with_base(None, None, &file_base),
+            Err(AdapterError::StorageUnavailable(_))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symbolic_link_is_never_used_as_the_vault_directory() {
+        let base = tempdir().expect("base directory");
+        let elsewhere = tempdir().expect("link target");
+        std::os::unix::fs::symlink(elsewhere.path(), super::scoped_path(base.path(), "scope-a"))
+            .expect("symbolic link");
+
+        assert_eq!(
+            unavailable(open_default_with_store(
+                "scope-a",
+                Some(base.path()),
+                Some(EXPLICIT_SECRET),
+                Path::new(""),
+                &FakeCredentialStore::default(),
+            )),
+            "the vault directory must not be a symbolic link"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn automatic_storage_is_private_to_the_current_user() {
@@ -955,10 +1239,5 @@ mod tests {
                 & 0o777,
             0o600
         );
-    }
-
-    #[allow(dead_code)]
-    fn _path_contract(path: &Path) -> bool {
-        path.is_absolute()
     }
 }

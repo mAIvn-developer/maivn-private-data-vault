@@ -6,14 +6,18 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+aes-gcm = { version = "=0.11.1", default-features = false, features = ["aes", "zeroize"] }
 argon2 = { version = "0.5.3", features = ["zeroize"] }
 chacha20poly1305 = "0.10.1"
 fs2 = "0.4.3"
 hex = "0.4.3"
 hmac = "0.12.1"
+hmac-chunk = { package = "hmac", version = "=0.13.0", features = ["zeroize"] }
+hkdf = "=0.13.0"
 rand_core = { version = "0.6.4", features = ["getrandom"] }
 serde_json = "1.0.140"
 sha2 = "0.10.9"
+sha2-chunk = { package = "sha2", version = "=0.11.0", features = ["zeroize"] }
 thiserror = "2.0.12"
 zeroize = "1.8.1"
 

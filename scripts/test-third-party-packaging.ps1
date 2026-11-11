@@ -23,7 +23,7 @@ try {
     try {
         $requiredWheel = @('private_data_vault/THIRD_PARTY_NOTICES','private_data_vault/_third_party/option_ext_0_2_0/LICENSE.txt','private_data_vault/_third_party/option_ext_0_2_0/src/lib.rs','private_data_vault/_third_party/option_ext_0_2_0/src/impl.rs')
         foreach ($name in $requiredWheel) { if (-not ($zip.Entries.FullName -contains $name)) { throw "Wheel missing $name" } }
-        $expected = @{ 'private_data_vault/THIRD_PARTY_NOTICES'='470946e6be358a7a25acf813b985d342558dff680b9c984d7a10aae969949c31'; 'private_data_vault/_third_party/option_ext_0_2_0/Cargo.toml'='ecd67cb17a0586f1406b7d494ef93191ed8ebf149db46667a7778052d94e1e6c'; 'private_data_vault/_third_party/option_ext_0_2_0/Cargo.toml.orig'='202b034590ddf9857aaa639982f7fa8d0b2d36abc4e8223b0211bcd104e34180'; 'private_data_vault/_third_party/option_ext_0_2_0/LICENSE.txt'='66a3107d5ad6a058aab753eaac2047ccb2ed0e39465dd0fe5844da3e300d5172'; 'private_data_vault/_third_party/option_ext_0_2_0/README.md'='4778f769203e879f816c7b8538f427dd542755fe2efde9ee2193815b199c8648'; 'private_data_vault/_third_party/option_ext_0_2_0/src/lib.rs'='5a0a1fb2ca896a06bcbc32024c8fe64be682170585be6313ba3ff2a87672d1fc'; 'private_data_vault/_third_party/option_ext_0_2_0/src/impl.rs'='2f0b6f0421c4d37b1a8f0412cf71e9720cb8c5ddcec61ac802474e40ab8a3f9b' }
+        $expected = @{ 'private_data_vault/THIRD_PARTY_NOTICES'='3ebc9af4d965eb5dcc8fba554b36fa17ee92c5ed57149ec524fb5ba7af7829cc'; 'private_data_vault/_third_party/option_ext_0_2_0/Cargo.toml'='ecd67cb17a0586f1406b7d494ef93191ed8ebf149db46667a7778052d94e1e6c'; 'private_data_vault/_third_party/option_ext_0_2_0/Cargo.toml.orig'='202b034590ddf9857aaa639982f7fa8d0b2d36abc4e8223b0211bcd104e34180'; 'private_data_vault/_third_party/option_ext_0_2_0/LICENSE.txt'='66a3107d5ad6a058aab753eaac2047ccb2ed0e39465dd0fe5844da3e300d5172'; 'private_data_vault/_third_party/option_ext_0_2_0/README.md'='4778f769203e879f816c7b8538f427dd542755fe2efde9ee2193815b199c8648'; 'private_data_vault/_third_party/option_ext_0_2_0/src/lib.rs'='5a0a1fb2ca896a06bcbc32024c8fe64be682170585be6313ba3ff2a87672d1fc'; 'private_data_vault/_third_party/option_ext_0_2_0/src/impl.rs'='2f0b6f0421c4d37b1a8f0412cf71e9720cb8c5ddcec61ac802474e40ab8a3f9b' }
         foreach ($name in $expected.Keys) { $stream = ($zip.Entries | Where-Object FullName -eq $name).Open(); try { $hash = [System.BitConverter]::ToString(([Security.Cryptography.SHA256]::Create()).ComputeHash($stream)).Replace('-', '').ToLowerInvariant() } finally { $stream.Dispose() }; if ($hash -ne $expected[$name]) { throw "Wheel source hash mismatch: $name" } }
     } finally { $zip.Dispose() }
     $names = @(tar -tf $sdist.FullName)
@@ -35,8 +35,8 @@ try {
     $sdistRoot = Get-ChildItem -LiteralPath $extracted -Directory | Select-Object -First 1
     if (-not $sdistRoot) { throw 'sdist extraction did not produce a package root.' }
     $sdistExpected = @{
-        'crates/private-data-vault-py/THIRD_PARTY_NOTICES' = '470946e6be358a7a25acf813b985d342558dff680b9c984d7a10aae969949c31'
-        'python/private_data_vault/THIRD_PARTY_NOTICES' = '470946e6be358a7a25acf813b985d342558dff680b9c984d7a10aae969949c31'
+        'crates/private-data-vault-py/THIRD_PARTY_NOTICES' = '3ebc9af4d965eb5dcc8fba554b36fa17ee92c5ed57149ec524fb5ba7af7829cc'
+        'python/private_data_vault/THIRD_PARTY_NOTICES' = '3ebc9af4d965eb5dcc8fba554b36fa17ee92c5ed57149ec524fb5ba7af7829cc'
         'python/private_data_vault/_third_party/option_ext_0_2_0/Cargo.toml' = 'ecd67cb17a0586f1406b7d494ef93191ed8ebf149db46667a7778052d94e1e6c'
         'python/private_data_vault/_third_party/option_ext_0_2_0/Cargo.toml.orig' = '202b034590ddf9857aaa639982f7fa8d0b2d36abc4e8223b0211bcd104e34180'
         'python/private_data_vault/_third_party/option_ext_0_2_0/LICENSE.txt' = '66a3107d5ad6a058aab753eaac2047ccb2ed0e39465dd0fe5844da3e300d5172'

@@ -98,9 +98,92 @@ class ExchangeVaultTests(unittest.TestCase):
         with self.assertRaises(self.module.VaultError):
             replayed.load_document(TENANT, RECORD)
 
+    def test_generation_zero_is_never_imported(self) -> None:
+        _generation, original, document, value_map = self._seal()
+        importing = self.module.ExchangeVault(SALT, SECRET)
+        with self.assertRaises(self.module.VaultError):
+            importing.import_record(TENANT, RECORD, 0, original, document, value_map)
+        with self.assertRaises(self.module.RecordNotFound):
+            importing.load_document(TENANT, RECORD)
+
     def test_a_short_salt_is_rejected_at_construction(self) -> None:
         with self.assertRaises(self.module.VaultError):
             self.module.ExchangeVault(b"short", SECRET)
+
+    def test_failures_map_to_their_exception_classes(self) -> None:
+        generation, original, document, value_map = self._seal()
+        wrong = self.module.ExchangeVault(SALT, b"a-different-secret")
+        wrong.import_record(TENANT, RECORD, generation, original, document, value_map)
+        for load in (wrong.load_document, wrong.load_original, wrong.load_value_map):
+            with (
+                self.subTest(load=load.__name__),
+                self.assertRaises(self.module.AuthenticationFailed),
+            ):
+                load(TENANT, RECORD)
+
+        replayed = self.module.ExchangeVault(SALT, SECRET)
+        replayed.import_record(
+            TENANT, RECORD, generation + 1, original, document, value_map
+        )
+        with self.assertRaises(self.module.RollbackDetected):
+            replayed.load_value_map(TENANT, RECORD)
+
+        empty = self.module.ExchangeVault(SALT, SECRET)
+        for load in (empty.load_document, empty.load_original, empty.load_value_map):
+            with (
+                self.subTest(load=load.__name__),
+                self.assertRaises(self.module.RecordNotFound),
+            ):
+                load(TENANT, RECORD)
+        with self.assertRaises(self.module.RecordNotFound):
+            empty.replace_record(TENANT, RECORD, b"o", b"d", b"{}")
+        with self.assertRaises(self.module.VaultError):
+            empty.seal_record(TENANT, RECORD, b"o", b"d", b"not json")
+        with self.assertRaises(self.module.VaultError):
+            empty.seal_record("", RECORD, b"o", b"d", b"{}")
+
+    def test_a_rotated_key_opens_old_records_and_seals_new_ones(self) -> None:
+        generation, original, document, value_map = self._seal()
+        rotated = self.module.ExchangeVault(
+            SALT, b"rotated-secret", key_version=2, decrypt_only={1: SECRET}
+        )
+        rotated.import_record(TENANT, RECORD, generation, original, document, value_map)
+        self.assertEqual(rotated.load_document(TENANT, RECORD), b"redacted bytes")
+        next_generation, *sealed = rotated.replace_record(
+            TENANT, RECORD, b"original two", b"redacted two", b"{}"
+        )
+
+        old_key_only = self.module.ExchangeVault(SALT, SECRET)
+        old_key_only.import_record(TENANT, RECORD, next_generation, *sealed)
+        with self.assertRaisesRegex(self.module.VaultError, "version 2 is unavailable"):
+            old_key_only.load_document(TENANT, RECORD)
+        with self.assertRaises(self.module.VaultError):
+            self.module.ExchangeVault(
+                SALT, b"rotated-secret", key_version=2, decrypt_only={2: SECRET}
+            )
+
+    def test_a_replacement_after_rotation_opens_with_the_active_key_alone(self) -> None:
+        # The managed adapter's rotation contract: a record sealed under a
+        # retired version is replaced through a vault whose ACTIVE key is the
+        # current one, and the new generation needs no historical key to open.
+        generation, original, document, value_map = self._seal()
+        rotated = self.module.ExchangeVault(
+            SALT, b"rotated-secret", key_version=2, decrypt_only={1: SECRET}
+        )
+        rotated.import_record(TENANT, RECORD, generation, original, document, value_map)
+        next_generation, *sealed = rotated.replace_record(
+            TENANT, RECORD, b"original two", b"redacted two", b'{"k":"v"}'
+        )
+        self.assertEqual(next_generation, generation + 1)
+        self.assertTrue(all(item[8:12] == (2).to_bytes(4, "big") for item in sealed))
+
+        active_only = self.module.ExchangeVault(SALT, b"rotated-secret", key_version=2)
+        active_only.import_record(TENANT, RECORD, next_generation, *sealed)
+        self.assertEqual(active_only.load_original(TENANT, RECORD), b"original two")
+        self.assertEqual(active_only.load_document(TENANT, RECORD), b"redacted two")
+        self.assertEqual(
+            json.loads(active_only.load_value_map(TENANT, RECORD)), {"k": "v"}
+        )
 
 
 if __name__ == "__main__":

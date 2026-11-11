@@ -1,45 +1,25 @@
 use std::{
     collections::BTreeSet,
     fs::{self, File, OpenOptions},
-    io::{Read, Seek, SeekFrom, Write},
+    io::{Read, Write},
     path::{Path, PathBuf},
     time::SystemTime,
 };
 
 use fs2::FileExt;
 use rand_core::{OsRng, RngCore};
-use sha2::{Digest, Sha256};
 
 use crate::{
     ContentKind, GenerationRead, GenerationTransaction, PendingDocument, PurgeKeys, StorageBackend,
     StorageError,
 };
 
-const STATE_MAGIC: &[u8; 8] = b"PDVST002";
+mod generation;
+mod state;
+mod sweep;
 
-/// One slot: magic, generation, salt, instance id, counter, checksum.
-const SLOT_BYTES: usize = 8 + 8 + 16 + 11 + 8 + 32;
-
-/// Two slots, written alternately.
-///
-/// The previous format kept ONE record and overwrote it in place, protected by
-/// nothing but a magic string and a length check. That is a nonce-reuse hazard,
-/// which for XChaCha20-Poly1305 is the one failure that destroys
-/// confidentiality outright rather than degrading it: with `next_counter` at
-/// 255, the update to 256 rewrites `..00ff` to `..0100`, and a power loss
-/// during that write can leave `..0000` durable. Reopening would accept counter
-/// zero and reissue a nonce prefix already used under the same key. Two
-/// keystreams under one nonce are XOR-recoverable, and the Poly1305 key falls
-/// out with them.
-///
-/// So: never overwrite the live record. Write the OTHER slot, checksum it,
-/// sync it, and let the higher generation win. A torn write damages only the
-/// slot being written, whose checksum then fails, and the previous generation
-/// is still intact beside it. The counter can skip forward on a crash; it can
-/// never go backwards.
-const STATE_BYTES: usize = SLOT_BYTES * 2;
-const GENERATION_MAGIC: &[u8; 8] = b"PDVGEN01";
-const GENERATION_FILE_BYTES: usize = 8 + 8 + 32;
+use state::{State, read_state, write_state};
+use sweep::sweep_directory;
 
 /// Filesystem-backed ciphertext storage with a persistent nonce sequence.
 #[derive(Clone, Debug)]
@@ -98,45 +78,26 @@ impl LocalBackend {
         Ok(())
     }
 
-    fn value_path(&self, storage_key: &[u8; 32]) -> PathBuf {
-        self.root
-            .join("values")
-            .join(format!("{}.pvm", hex::encode(storage_key)))
-    }
-
-    fn versioned_value_path(&self, storage_key: &[u8; 32], generation: u64) -> PathBuf {
-        self.root
-            .join("values")
-            .join(format!("{}.{generation:020}.pvm", hex::encode(storage_key)))
-    }
-
-    fn document_path(&self, storage_key: &[u8; 32]) -> PathBuf {
-        self.root
-            .join("documents")
-            .join(format!("{}.pvd", hex::encode(storage_key)))
-    }
-
-    fn original_path(&self, storage_key: &[u8; 32]) -> PathBuf {
-        self.root
-            .join("originals")
-            .join(format!("{}.pvo", hex::encode(storage_key)))
-    }
-
-    fn versioned_content_path(
+    /// Where one sealed object lives: `<kind directory>/<hex key>.<extension>`
+    /// for a standalone object, `<hex key>.<generation:020>.<extension>` for
+    /// one generation of a record bundle.
+    fn object_path(
         &self,
         storage_key: &[u8; 32],
         kind: ContentKind,
-        generation: u64,
+        generation: Option<u64>,
     ) -> PathBuf {
         let (directory, extension) = match kind {
             ContentKind::ValueMap => ("values", "pvm"),
             ContentKind::Document => ("documents", "pvd"),
             ContentKind::Original => ("originals", "pvo"),
         };
-        self.root.join(directory).join(format!(
-            "{}.{generation:020}.{extension}",
-            hex::encode(storage_key)
-        ))
+        let key = hex::encode(storage_key);
+        let name = match generation {
+            None => format!("{key}.{extension}"),
+            Some(generation) => format!("{key}.{generation:020}.{extension}"),
+        };
+        self.root.join(directory).join(name)
     }
 
     fn generation_path(&self, record_key: &[u8; 32]) -> PathBuf {
@@ -149,14 +110,6 @@ impl LocalBackend {
         self.root
             .join("generation-locks")
             .join(format!("{}.lock", hex::encode(record_key)))
-    }
-
-    fn content_path(&self, storage_key: &[u8; 32], kind: ContentKind) -> PathBuf {
-        match kind {
-            ContentKind::ValueMap => self.value_path(storage_key),
-            ContentKind::Document => self.document_path(storage_key),
-            ContentKind::Original => self.original_path(storage_key),
-        }
     }
 }
 
@@ -193,29 +146,22 @@ impl StorageBackend for LocalBackend {
         &self,
         record_key: &[u8; 32],
     ) -> Result<Box<dyn GenerationRead>, StorageError> {
-        let lock = open_generation_lock(&self.generation_lock_path(record_key))?;
-        fs2::FileExt::lock_shared(&lock)?;
-        let generation = read_generation_file(&self.generation_path(record_key), record_key)?;
-        Ok(Box::new(LocalGenerationRead {
-            _lock: lock,
-            generation,
-        }))
+        generation::begin_read(
+            &self.generation_lock_path(record_key),
+            &self.generation_path(record_key),
+            record_key,
+        )
     }
 
     fn begin_generation_transaction(
         &self,
         record_key: &[u8; 32],
     ) -> Result<Box<dyn GenerationTransaction>, StorageError> {
-        let lock = open_generation_lock(&self.generation_lock_path(record_key))?;
-        lock.lock_exclusive()?;
-        let metadata_path = self.generation_path(record_key);
-        let generation = read_generation_file(&metadata_path, record_key)?;
-        Ok(Box::new(LocalGenerationTransaction {
-            _lock: lock,
-            metadata_path,
-            record_key: *record_key,
-            generation,
-        }))
+        generation::begin_transaction(
+            &self.generation_lock_path(record_key),
+            self.generation_path(record_key),
+            record_key,
+        )
     }
 
     fn list_record_keys(
@@ -255,11 +201,14 @@ impl StorageBackend for LocalBackend {
     }
 
     fn store_value_map(&self, storage_key: &[u8; 32], sealed: &[u8]) -> Result<(), StorageError> {
-        store_sealed_value(&self.value_path(storage_key), sealed)
+        store_sealed_value(
+            &self.object_path(storage_key, ContentKind::ValueMap, None),
+            sealed,
+        )
     }
 
     fn load_value_map(&self, storage_key: &[u8; 32]) -> Result<Vec<u8>, StorageError> {
-        read_sealed_value(&self.value_path(storage_key))
+        read_sealed_value(&self.object_path(storage_key, ContentKind::ValueMap, None))
     }
 
     fn store_versioned_value_map(
@@ -268,7 +217,10 @@ impl StorageBackend for LocalBackend {
         generation: u64,
         sealed: &[u8],
     ) -> Result<(), StorageError> {
-        store_sealed_value(&self.versioned_value_path(storage_key, generation), sealed)
+        store_sealed_value(
+            &self.object_path(storage_key, ContentKind::ValueMap, Some(generation)),
+            sealed,
+        )
     }
 
     fn load_versioned_value_map(
@@ -276,7 +228,7 @@ impl StorageBackend for LocalBackend {
         storage_key: &[u8; 32],
         generation: u64,
     ) -> Result<Vec<u8>, StorageError> {
-        read_sealed_value(&self.versioned_value_path(storage_key, generation))
+        read_sealed_value(&self.object_path(storage_key, ContentKind::ValueMap, Some(generation)))
     }
 
     fn begin_content(
@@ -285,7 +237,7 @@ impl StorageBackend for LocalBackend {
         operation_nonce: &[u8; 19],
         kind: ContentKind,
     ) -> Result<Box<dyn PendingDocument>, StorageError> {
-        begin_pending_content(self.content_path(storage_key, kind), operation_nonce)
+        begin_pending_content(self.object_path(storage_key, kind, None), operation_nonce)
     }
 
     fn open_content(
@@ -293,7 +245,7 @@ impl StorageBackend for LocalBackend {
         storage_key: &[u8; 32],
         kind: ContentKind,
     ) -> Result<Box<dyn Read + Send>, StorageError> {
-        open_sealed_content(&self.content_path(storage_key, kind))
+        open_sealed_content(&self.object_path(storage_key, kind, None))
     }
 
     fn begin_versioned_content(
@@ -304,7 +256,7 @@ impl StorageBackend for LocalBackend {
         generation: u64,
     ) -> Result<Box<dyn PendingDocument>, StorageError> {
         begin_pending_content(
-            self.versioned_content_path(storage_key, kind, generation),
+            self.object_path(storage_key, kind, Some(generation)),
             operation_nonce,
         )
     }
@@ -315,7 +267,7 @@ impl StorageBackend for LocalBackend {
         kind: ContentKind,
         generation: u64,
     ) -> Result<Box<dyn Read + Send>, StorageError> {
-        open_sealed_content(&self.versioned_content_path(storage_key, kind, generation))
+        open_sealed_content(&self.object_path(storage_key, kind, Some(generation)))
     }
 
     fn purge(&self, keys: &PurgeKeys) -> Result<(), StorageError> {
@@ -323,39 +275,30 @@ impl StorageBackend for LocalBackend {
         let value_directory = self.root.join("values");
         let document_directory = self.root.join("documents");
         let original_directory = self.root.join("originals");
-        let value_result = remove_record_objects(&value_directory, &keys.legacy_value_map, "pvm");
-        let document_result =
-            remove_record_objects(&document_directory, &keys.legacy_document, "pvd");
-        let original_result =
-            remove_record_objects(&original_directory, &keys.legacy_original, "pvo");
-        let versioned_value_result =
-            remove_record_objects(&value_directory, &keys.versioned_value_map, "pvm");
-        let versioned_document_result =
-            remove_record_objects(&document_directory, &keys.versioned_document, "pvd");
-        let versioned_original_result =
-            remove_record_objects(&original_directory, &keys.versioned_original, "pvo");
-        let generation_result = remove_file_if_present(&generation_path);
+        // Every removal and sync is attempted; the first failure, in this
+        // order, is the result.
+        //
         // An unlink is no more durable than a rename. Without syncing the
         // directory, a purge can report success and a crash moments later
         // restore the entry -- which for a HARD DELETE is the whole claim
         // failing, not a performance detail. Owner ruling 2026-08-05: private
         // material is removed, not marked, and material that comes back was
         // never removed.
-        let value_sync = sync_directory(&value_directory);
-        let document_sync = sync_directory(&document_directory);
-        let original_sync = sync_directory(&original_directory);
-        let generation_sync = sync_parent_directory(&generation_path);
-        value_result
-            .and(document_result)
-            .and(original_result)
-            .and(versioned_value_result)
-            .and(versioned_document_result)
-            .and(versioned_original_result)
-            .and(generation_result)
-            .and(value_sync)
-            .and(document_sync)
-            .and(original_sync)
-            .and(generation_sync)
+        [
+            remove_record_objects(&value_directory, &keys.legacy_value_map, "pvm"),
+            remove_record_objects(&document_directory, &keys.legacy_document, "pvd"),
+            remove_record_objects(&original_directory, &keys.legacy_original, "pvo"),
+            remove_record_objects(&value_directory, &keys.versioned_value_map, "pvm"),
+            remove_record_objects(&document_directory, &keys.versioned_document, "pvd"),
+            remove_record_objects(&original_directory, &keys.versioned_original, "pvo"),
+            remove_file_if_present(&generation_path),
+            sync_directory(&value_directory),
+            sync_directory(&document_directory),
+            sync_directory(&original_directory),
+            sync_parent_directory(&generation_path),
+        ]
+        .into_iter()
+        .collect()
     }
 
     fn purge_expired(&self, cutoff: SystemTime) -> Result<usize, StorageError> {
@@ -371,22 +314,21 @@ impl StorageBackend for LocalBackend {
     }
 }
 
+/// `<64 hex record key>.<32 hex nonce>.tmp`, the name of an interrupted
+/// generation-file write.
 fn is_generation_temporary(name: &str) -> bool {
+    let is_lower_hex = |value: &str, length: usize| {
+        value.len() == length
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    };
     let mut components = name.split('.');
-    let record_key = components.next();
-    let nonce = components.next();
-    let extension = components.next();
-    record_key.is_some_and(|value| {
-        value.len() == 64
-            && value
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    }) && nonce.is_some_and(|value| {
-        value.len() == 32
-            && value
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    }) && extension == Some("tmp")
+    components.next().is_some_and(|key| is_lower_hex(key, 64))
+        && components
+            .next()
+            .is_some_and(|nonce| is_lower_hex(nonce, 32))
+        && components.next() == Some("tmp")
         && components.next().is_none()
 }
 
@@ -452,110 +394,9 @@ fn open_sealed_content(path: &Path) -> Result<Box<dyn Read + Send>, StorageError
     }
 }
 
-/// Removes every file in one directory older than `cutoff`.
-///
-/// A file whose modification time cannot be read is left alone rather than
-/// deleted. Retention deleting something it could not evaluate would be a
-/// silent data loss, and the sweep runs again shortly.
-fn sweep_directory(directory: &Path, cutoff: SystemTime) -> Result<usize, StorageError> {
-    let entries = match fs::read_dir(directory) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-        Err(error) => return Err(error.into()),
-    };
-    let mut removed = 0;
-    for entry in entries {
-        let entry = entry?;
-        if !entry.file_type()?.is_file() {
-            continue;
-        }
-        let Ok(modified) = entry.metadata().and_then(|data| data.modified()) else {
-            continue;
-        };
-        if modified < cutoff {
-            // Claim the path by renaming BEFORE deciding, rather than
-            // re-checking the timestamp and then deleting.
-            //
-            // A stat-then-delete is racy however tightly it is written: the
-            // storage key derives from the record identity, so a re-seal of the
-            // same record lands at exactly this path, and a replacement written
-            // between the check and the unlink is destroyed while well inside
-            // its retention period. Rename is atomic, so moving the file aside
-            // first takes ownership of whichever version was there; anything
-            // written afterwards lands on a now-empty path and is untouched.
-            // If what we claimed turns out to be fresh, it goes back.
-            if claim_and_remove_if_expired(&entry.path(), cutoff)? {
-                removed += 1;
-            }
-        }
-    }
-    Ok(removed)
-}
-
-/// Atomically claims `path` and removes it only if it is genuinely expired.
-///
-/// Returns whether an object was removed. A file that turns out to be inside
-/// its retention period is put back where it came from.
-///
-/// The `.sweeping` suffix cannot collide with a stored object: storage names
-/// are hex of a 32-byte key plus `.pvm`/`.pvd`, and this adds a suffix no
-/// storage path produces. A crash between the two renames leaves one such file
-/// behind, which the next sweep re-evaluates on its own age -- material is
-/// never lost, at worst it lingers one interval longer.
-fn claim_and_remove_if_expired(path: &Path, cutoff: SystemTime) -> Result<bool, StorageError> {
-    let claimed = path.with_extension("sweeping");
-    match fs::rename(path, &claimed) {
-        Ok(()) => {}
-        // Already gone: another sweep, or a purge, got there first.
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(error.into()),
-    }
-
-    let expired = fs::metadata(&claimed)
-        .and_then(|data| data.modified())
-        .is_ok_and(|modified| modified < cutoff);
-
-    if expired {
-        remove_file_if_present(&claimed)?;
-        sync_parent_directory(&claimed)?;
-        return Ok(true);
-    }
-
-    // Fresh after all. Put it back. If a newer write has already taken the
-    // path, keep that one and drop this older copy rather than overwriting
-    // current material with what we moved aside.
-    if path.exists() {
-        remove_file_if_present(&claimed)?;
-    } else {
-        fs::rename(&claimed, path)?;
-    }
-    Ok(false)
-}
-
 /// Makes a just-created or just-removed directory entry durable.
-///
-/// POSIX requires fsync on the containing directory for a rename or unlink to
-/// survive a crash; syncing the file alone is not enough. Windows has no
-/// equivalent operation on a directory handle from safe std, and its rename is
-/// already ordered against the file data by the filesystem, so this is a no-op
-/// there rather than a silently skipped guarantee -- stated so that nobody
-/// later reads the absence as an oversight.
-#[cfg(unix)]
 fn sync_parent_directory(path: &Path) -> Result<(), StorageError> {
-    let Some(parent) = path.parent() else {
-        return Ok(());
-    };
-    File::open(parent)?.sync_all()?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-#[allow(
-    clippy::unnecessary_wraps,
-    reason = "matches the unix signature, which genuinely can fail"
-)]
-fn sync_parent_directory(_path: &Path) -> Result<(), StorageError> {
-    Ok(())
+    path.parent().map_or(Ok(()), sync_directory)
 }
 
 fn remove_file_if_present(path: &Path) -> Result<(), StorageError> {
@@ -597,6 +438,12 @@ fn remove_record_objects(
     result
 }
 
+/// POSIX requires fsync on the containing directory for a rename or unlink to
+/// survive a crash; syncing the file alone is not enough. Windows has no
+/// equivalent operation on a directory handle from safe std, and its rename is
+/// already ordered against the file data by the filesystem, so this is a no-op
+/// there rather than a silently skipped guarantee -- stated so that nobody
+/// later reads the absence as an oversight.
 #[cfg(unix)]
 fn sync_directory(directory: &Path) -> Result<(), StorageError> {
     File::open(directory)?.sync_all()?;
@@ -662,124 +509,6 @@ impl Drop for LocalPendingDocument {
     }
 }
 
-struct LocalGenerationRead {
-    _lock: File,
-    generation: Option<u64>,
-}
-
-impl GenerationRead for LocalGenerationRead {
-    fn generation(&self) -> Option<u64> {
-        self.generation
-    }
-}
-
-struct LocalGenerationTransaction {
-    _lock: File,
-    metadata_path: PathBuf,
-    record_key: [u8; 32],
-    generation: Option<u64>,
-}
-
-impl GenerationRead for LocalGenerationTransaction {
-    fn generation(&self) -> Option<u64> {
-        self.generation
-    }
-}
-
-impl GenerationTransaction for LocalGenerationTransaction {
-    fn compare_and_swap(&mut self, expected: Option<u64>, next: u64) -> Result<(), StorageError> {
-        if self.generation != expected {
-            return Err(StorageError::GenerationConflict);
-        }
-        if next == 0 || expected.is_some_and(|current| next <= current) {
-            return Err(StorageError::InvalidMetadata);
-        }
-        write_generation_file(&self.metadata_path, &self.record_key, next)?;
-        self.generation = Some(next);
-        Ok(())
-    }
-}
-
-fn open_generation_lock(path: &Path) -> Result<File, StorageError> {
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(path)?;
-    set_private_file_permissions(&file)?;
-    Ok(file)
-}
-
-fn encode_generation(record_key: &[u8; 32], generation: u64) -> [u8; GENERATION_FILE_BYTES] {
-    let mut bytes = [0_u8; GENERATION_FILE_BYTES];
-    bytes[..8].copy_from_slice(GENERATION_MAGIC);
-    bytes[8..16].copy_from_slice(&generation.to_be_bytes());
-    let mut digest_input = Vec::with_capacity(record_key.len() + 16);
-    digest_input.extend_from_slice(record_key);
-    digest_input.extend_from_slice(&bytes[..16]);
-    bytes[16..].copy_from_slice(&Sha256::digest(&digest_input));
-    bytes
-}
-
-fn decode_generation(bytes: &[u8], record_key: &[u8; 32]) -> Option<u64> {
-    if bytes.len() != GENERATION_FILE_BYTES || &bytes[..8] != GENERATION_MAGIC {
-        return None;
-    }
-    let mut digest_input = Vec::with_capacity(record_key.len() + 16);
-    digest_input.extend_from_slice(record_key);
-    digest_input.extend_from_slice(&bytes[..16]);
-    let digest = Sha256::digest(&digest_input);
-    if &bytes[16..] != digest.as_slice() {
-        return None;
-    }
-    let generation = u64::from_be_bytes(bytes[8..16].try_into().ok()?);
-    (generation != 0).then_some(generation)
-}
-
-fn read_generation_file(path: &Path, record_key: &[u8; 32]) -> Result<Option<u64>, StorageError> {
-    let bytes = match fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
-    };
-    if bytes.is_empty() {
-        return Ok(None);
-    }
-    if bytes.len() != GENERATION_FILE_BYTES {
-        return Err(StorageError::InvalidMetadata);
-    }
-    decode_generation(&bytes, record_key)
-        .map(Some)
-        .ok_or(StorageError::InvalidMetadata)
-}
-
-fn write_generation_file(
-    path: &Path,
-    record_key: &[u8; 32],
-    generation: u64,
-) -> Result<(), StorageError> {
-    let mut random = [0_u8; 16];
-    OsRng.fill_bytes(&mut random);
-    let temporary = path.with_extension(format!("{}.tmp", hex::encode(random)));
-    let write_result = (|| {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)?;
-        set_private_file_permissions(&file)?;
-        file.write_all(&encode_generation(record_key, generation))?;
-        file.sync_all()?;
-        drop(file);
-        fs::rename(&temporary, path)?;
-        sync_parent_directory(path)
-    })();
-    if write_result.is_err() {
-        let _ignored = fs::remove_file(&temporary);
-    }
-    write_result
-}
-
 #[cfg(unix)]
 fn create_private_directory(path: &Path) -> Result<(), StorageError> {
     use std::os::unix::fs::PermissionsExt;
@@ -809,101 +538,5 @@ fn set_private_file_permissions(file: &File) -> Result<(), StorageError> {
     reason = "matches the Unix implementation, which can fail"
 )]
 fn set_private_file_permissions(_file: &File) -> Result<(), StorageError> {
-    Ok(())
-}
-
-#[derive(Clone, Copy)]
-struct State {
-    salt: [u8; 16],
-    instance_id: [u8; 11],
-    next_counter: u64,
-    /// Monotonic write generation. Decides which slot is live; never reused.
-    generation: u64,
-}
-
-/// Serialise one slot with its checksum.
-fn encode_slot(state: &State) -> [u8; SLOT_BYTES] {
-    let mut bytes = [0; SLOT_BYTES];
-    bytes[..8].copy_from_slice(STATE_MAGIC);
-    bytes[8..16].copy_from_slice(&state.generation.to_be_bytes());
-    bytes[16..32].copy_from_slice(&state.salt);
-    bytes[32..43].copy_from_slice(&state.instance_id);
-    bytes[43..51].copy_from_slice(&state.next_counter.to_be_bytes());
-    let digest = Sha256::digest(&bytes[..51]);
-    bytes[51..].copy_from_slice(&digest);
-    bytes
-}
-
-/// Parse one slot, returning `None` when it is absent, torn or corrupt.
-///
-/// A damaged slot is not an error. It is the expected state of the slot that
-/// was mid-write when the power went, and the whole point of keeping two.
-fn decode_slot(bytes: &[u8]) -> Option<State> {
-    if bytes.len() < SLOT_BYTES || &bytes[..8] != STATE_MAGIC {
-        return None;
-    }
-    let digest = Sha256::digest(&bytes[..51]);
-    // Constant time is unnecessary here: this is an integrity check against
-    // power loss, not a secret comparison, and the input is not attacker-chosen
-    // in the sense that would make timing meaningful.
-    if digest.as_slice() != &bytes[51..SLOT_BYTES] {
-        return None;
-    }
-    let mut generation = [0; 8];
-    generation.copy_from_slice(&bytes[8..16]);
-    let mut salt = [0; 16];
-    salt.copy_from_slice(&bytes[16..32]);
-    let mut instance_id = [0; 11];
-    instance_id.copy_from_slice(&bytes[32..43]);
-    let mut counter = [0; 8];
-    counter.copy_from_slice(&bytes[43..51]);
-    Some(State {
-        salt,
-        instance_id,
-        next_counter: u64::from_be_bytes(counter),
-        generation: u64::from_be_bytes(generation),
-    })
-}
-
-fn read_state(file: &mut File) -> Result<State, StorageError> {
-    file.seek(SeekFrom::Start(0))?;
-    let mut bytes = [0; STATE_BYTES];
-    file.read_exact(&mut bytes)
-        .map_err(|_| StorageError::InvalidMetadata)?;
-
-    // Highest valid generation wins. One torn slot is survivable and expected;
-    // both invalid means we cannot establish where the nonce counter had
-    // reached, and continuing from a guess is how a nonce gets reissued. Fail
-    // closed: a vault that will not open is recoverable from backup, a vault
-    // that reuses a nonce is not.
-    let first = decode_slot(&bytes[..SLOT_BYTES]);
-    let second = decode_slot(&bytes[SLOT_BYTES..]);
-    match (first, second) {
-        (Some(a), Some(b)) => Ok(if a.generation >= b.generation { a } else { b }),
-        (Some(only), None) | (None, Some(only)) => Ok(only),
-        (None, None) => Err(StorageError::InvalidMetadata),
-    }
-}
-
-fn write_state(file: &mut File, state: &State) -> Result<(), StorageError> {
-    // Write the slot the live record is NOT in, so a torn write cannot damage
-    // the only copy of where the nonce counter had reached.
-    let mut next = *state;
-    next.generation = state.generation.wrapping_add(1);
-    let offset = if next.generation.is_multiple_of(2) {
-        0
-    } else {
-        SLOT_BYTES
-    };
-
-    let encoded = encode_slot(&next);
-    file.seek(SeekFrom::Start(
-        u64::try_from(offset).expect("slot offset fits in u64"),
-    ))?;
-    file.write_all(&encoded)?;
-    // Sync before the caller is allowed to use the prefix. A returned nonce
-    // whose increment is still in the page cache is a nonce this vault can
-    // issue twice.
-    file.sync_all()?;
     Ok(())
 }

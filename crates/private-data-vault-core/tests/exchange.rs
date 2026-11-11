@@ -8,7 +8,9 @@
 
 use std::{collections::BTreeMap, io::Cursor};
 
-use private_data_vault_core::{MemoryBackend, RecordIdentity, Vault, VaultError};
+use private_data_vault_core::{
+    KeyVersion, Keyring, MemoryBackend, RecordIdentity, Vault, VaultError,
+};
 
 const SECRET: &[u8] = b"managed-exchange-test-secret";
 const SALT: [u8; 16] = *b"tenant-salt-0001";
@@ -49,7 +51,10 @@ fn a_record_sealed_in_one_backend_opens_from_a_fresh_one() {
     // A completely fresh backend, as if another process had fetched the
     // sealed objects from the database.
     let opening = vault();
-    opening.backend().import_record(&identity(), &exported);
+    opening
+        .backend()
+        .import_record(&identity(), &exported)
+        .expect("imports");
 
     let mut document = Vec::new();
     opening
@@ -74,7 +79,10 @@ fn replacement_advances_the_generation_and_the_old_export_is_refused() {
     let first = seal_one("first-value");
 
     let replacing = vault();
-    replacing.backend().import_record(&identity(), &first);
+    replacing
+        .backend()
+        .import_record(&identity(), &first)
+        .expect("imports");
     replacing
         .replace_record(
             &identity(),
@@ -93,16 +101,22 @@ fn replacement_advances_the_generation_and_the_old_export_is_refused() {
     // newer generation must refuse to open: this is the replay protection the
     // generation column in the database row exists to carry.
     let replayed = vault();
-    replayed.backend().import_record(&identity(), &second);
-    replayed.backend().import_record(
-        &identity(),
-        &private_data_vault_core::ExchangeRecord {
-            generation: second.generation,
-            original: first.original.clone(),
-            document: first.document.clone(),
-            value_map: first.value_map.clone(),
-        },
-    );
+    replayed
+        .backend()
+        .import_record(&identity(), &second)
+        .expect("imports");
+    replayed
+        .backend()
+        .import_record(
+            &identity(),
+            &private_data_vault_core::ExchangeRecord {
+                generation: second.generation,
+                original: first.original.clone(),
+                document: first.document.clone(),
+                value_map: first.value_map.clone(),
+            },
+        )
+        .expect("imports");
     let mut sink = Vec::new();
     let refusal = replayed.load_document(&identity(), &mut sink);
     assert!(
@@ -112,12 +126,82 @@ fn replacement_advances_the_generation_and_the_old_export_is_refused() {
 }
 
 #[test]
+fn a_replacement_after_rotation_reseals_under_the_active_key_version() {
+    // The managed tier replaces a record sealed under a retired key version by
+    // hydrating it into a vault whose ACTIVE key is the tenant's current one.
+    // Replacement reads only the trusted generation, so the old key is not
+    // needed, and the new generation must carry the active version.
+    let first = seal_one("first-value");
+    let version_one = KeyVersion::new(1).expect("version is valid");
+    let version_two = KeyVersion::new(2).expect("version is valid");
+    let rotated = || {
+        Vault::open_keyring(
+            MemoryBackend::new(SALT),
+            Keyring::new(version_two, b"rotated-test-secret").expect("keyring is valid"),
+        )
+        .expect("rotated vault opens")
+    };
+
+    let replacing = rotated();
+    replacing
+        .backend()
+        .import_record(&identity(), &first)
+        .expect("imports");
+    replacing
+        .replace_record(
+            &identity(),
+            &mut Cursor::new(b"original two".to_vec()),
+            &mut Cursor::new(b"redacted two".to_vec()),
+            &values("second-value"),
+        )
+        .expect("replacement succeeds without the retired key");
+    let second = replacing
+        .backend()
+        .export_record(&identity())
+        .expect("replacement exports");
+    assert_eq!(second.generation, 2, "replacement advances the generation");
+    assert_eq!(&second.value_map[..8], b"PDVMAP02");
+    assert_eq!(
+        &second.value_map[8..12],
+        &2_u32.to_be_bytes(),
+        "the new generation is sealed under the active key version"
+    );
+
+    let opening = rotated();
+    opening
+        .backend()
+        .import_record(&identity(), &second)
+        .expect("imports");
+    assert_eq!(
+        opening
+            .load_value_map(&identity())
+            .expect("value map opens")["<PRIVATE_1>"],
+        "second-value"
+    );
+
+    // The retired key alone can no longer open the replaced record.
+    let retired = Vault::open_keyring(
+        MemoryBackend::new(SALT),
+        Keyring::new(version_one, SECRET).expect("keyring is valid"),
+    )
+    .expect("retired vault opens");
+    retired
+        .backend()
+        .import_record(&identity(), &second)
+        .expect("imports");
+    assert!(retired.load_value_map(&identity()).is_err());
+}
+
+#[test]
 fn a_wrong_secret_cannot_open_a_transported_record() {
     let exported = seal_one("secret-value");
 
     let wrong = Vault::open(MemoryBackend::new(SALT), b"a-different-secret")
         .expect("vault opens with any secret");
-    wrong.backend().import_record(&identity(), &exported);
+    wrong
+        .backend()
+        .import_record(&identity(), &exported)
+        .expect("imports");
     let mut sink = Vec::new();
     let refusal = wrong.load_document(&identity(), &mut sink);
     assert!(matches!(

@@ -10,6 +10,12 @@ on:
     tags:
       - "v*"
   workflow_dispatch:
+    inputs:
+      qualification_only:
+        description: Build and test artifacts without publishing
+        type: boolean
+        default: true
+        required: true
 
 concurrency:
   group: private-data-vault-pypi-${{ github.ref }}
@@ -34,7 +40,11 @@ jobs:
       - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
       - name: Release guard self-test (offline)
         run: uv run --with packaging --no-project --python 3.12 python scripts/release_guard_test.py
+      - name: Refuse branch publish intent
+        if: github.event_name == 'workflow_dispatch' && !inputs.qualification_only && github.ref_type != 'tag'
+        run: exit 1
       - name: Validate release version
+        if: github.event_name != 'workflow_dispatch' || !inputs.qualification_only
         run: uv run --with packaging --no-project --python 3.12 python scripts/release_guard.py
 
   wheels:
@@ -49,7 +59,7 @@ jobs:
             target: aarch64
           - os: macos-15-intel
             target: x86_64
-          - os: macos-14
+          - os: macos-15
             target: aarch64
           - os: windows-latest
             target: x64
@@ -67,7 +77,7 @@ jobs:
           working-directory: ${{ env.CRATE_DIR }}
           target: ${{ matrix.target }}
           manylinux: auto
-          args: --release --out dist --interpreter python3.12
+          args: --locked --release --out dist --interpreter python3.12
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: wheel-${{ matrix.os }}-${{ matrix.target }}
@@ -81,20 +91,92 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable, 2026-09-03
+      - name: Validate locked dependency resolution
+        run: cargo metadata --locked --format-version 1 > /dev/null
       - name: Build sdist
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
           working-directory: ${{ env.CRATE_DIR }}
           command: sdist
           args: --out dist
+      - name: Verify sdist lock
+        run: |
+          git diff --exit-code -- Cargo.lock
+          python scripts/verify_sdist_lock_test.py
+          python scripts/verify_sdist_lock.py crates/private-data-vault-py/dist
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: sdist
           path: ${{ env.CRATE_DIR }}/dist/*.tar.gz
           if-no-files-found: error
 
-  publish:
+  qualify:
     needs: [wheels, sdist]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {os: ubuntu-latest, artifact: wheel-ubuntu-latest-x86_64, python: "3.10"}
+          - {os: ubuntu-latest, artifact: wheel-ubuntu-latest-x86_64, python: "3.12"}
+          - {os: ubuntu-24.04-arm, artifact: wheel-ubuntu-latest-aarch64, python: "3.10"}
+          - {os: ubuntu-24.04-arm, artifact: wheel-ubuntu-latest-aarch64, python: "3.12"}
+          - {os: macos-15-intel, artifact: wheel-macos-15-intel-x86_64, python: "3.10"}
+          - {os: macos-15-intel, artifact: wheel-macos-15-intel-x86_64, python: "3.12"}
+          - {os: macos-15, artifact: wheel-macos-15-aarch64, python: "3.10"}
+          - {os: macos-15, artifact: wheel-macos-15-aarch64, python: "3.12"}
+          - {os: windows-latest, artifact: wheel-windows-latest-x64, python: "3.10"}
+          - {os: windows-latest, artifact: wheel-windows-latest-x64, python: "3.12"}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ matrix.artifact }}
+          path: qualification-dist
+      - name: Prepare private Windows test temp directory
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $testTemp = Join-Path $env:RUNNER_TEMP 'private-data-vault-tests'
+          New-Item -ItemType Directory -Path $testTemp -Force | Out-Null
+          $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+          $acl = [System.Security.AccessControl.DirectorySecurity]::new()
+          $acl.SetAccessRuleProtection($true, $false)
+          $inheritance = [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor
+            [System.Security.AccessControl.InheritanceFlags]::ObjectInherit
+          $rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
+            $identity,
+            [System.Security.AccessControl.FileSystemRights]::FullControl,
+            $inheritance,
+            [System.Security.AccessControl.PropagationFlags]::None,
+            [System.Security.AccessControl.AccessControlType]::Allow
+          )
+          $acl.AddAccessRule($rule)
+          Set-Acl -LiteralPath $testTemp -AclObject $acl
+          "MAIVN_VAULT_TEST_TEMP=$testTemp" >> $env:GITHUB_ENV
+      - name: Install exact artifact and run tests
+        shell: bash
+        run: |
+          uv venv .ci --python ${{ matrix.python }}
+          PY=.ci/bin/python; [ -x "$PY" ] || PY=.ci/Scripts/python.exe
+          uv pip install --python "$PY" pytest packaging
+          WHEEL=$("$PY" scripts/select_qualification_wheel.py qualification-dist)
+          uv pip install --python "$PY" --no-index --no-deps "$WHEEL"
+          if [ "$RUNNER_OS" = Windows ]; then
+            export TMPDIR="$MAIVN_VAULT_TEST_TEMP" TEMP="$MAIVN_VAULT_TEST_TEMP" TMP="$MAIVN_VAULT_TEST_TEMP"
+          fi
+          "$PY" -m pytest crates/private-data-vault-py/tests -q
+
+  publish:
+    if: github.ref_type == 'tag' && (github.event_name != 'workflow_dispatch' || !inputs.qualification_only)
+    needs: [qualify]
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
