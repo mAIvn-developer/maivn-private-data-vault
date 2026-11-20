@@ -5,6 +5,7 @@ import json
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from hashlib import sha256
 from pathlib import Path
 from threading import Barrier
 
@@ -41,6 +42,34 @@ class PublicApiTests(unittest.TestCase):
     def test_default_factory_requires_a_path_for_an_explicit_secret(self) -> None:
         with self.assertRaisesRegex(self.module.VaultError, "explicit path"):
             self.module.LocalVault.open_default("scope-a", secret=EXPLICIT_SECRET)
+
+    def test_default_requires_open_distinguishes_residue_from_persisted_metadata(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            scope = "interrupted-scope"
+            scope_hash = sha256(scope.encode()).hexdigest()
+            root = Path(directory) / scope_hash
+            root.mkdir()
+            (root / "vault.scope").write_text(scope_hash, encoding="ascii")
+            (root / ".initialize.lock").touch()
+            self.assertTrue(
+                self.module.LocalVault.default_exists(scope, path=directory)
+            )
+            self.assertFalse(
+                self.module.LocalVault.default_requires_open(scope, path=directory)
+            )
+            self.assertFalse(
+                self.module.LocalVault.default_requires_open(path=directory)
+            )
+
+            (root / "vault.initialized").touch()
+            self.assertTrue(
+                self.module.LocalVault.default_requires_open(scope, path=directory)
+            )
+            self.assertTrue(
+                self.module.LocalVault.default_requires_open(path=directory)
+            )
 
     def test_concurrent_merge_uses_shared_storage_lock(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

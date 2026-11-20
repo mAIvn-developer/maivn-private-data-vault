@@ -1085,7 +1085,7 @@ checksum = "f84267b20a16ea918e43c6a88433c2d54fa145c92a811b5b047ccbe153674483"
 
 [[package]]
 name = "private-data-vault-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -1107,7 +1107,7 @@ dependencies = [
 
 [[package]]
 name = "private-data-vault-py"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "directories",
  "fs2",

@@ -1,6 +1,6 @@
 use std::{
     fs::{self, File, OpenOptions},
-    io::Write,
+    io::{Read, Write},
     path::{Path, PathBuf},
 };
 
@@ -82,6 +82,25 @@ pub(crate) fn default_exists(
         let base = platform_vault_root()?;
         default_exists_with_base(scope, None, &base)
     }
+}
+
+pub(crate) fn default_requires_open(
+    scope: Option<&str>,
+    path: Option<&Path>,
+) -> Result<bool, AdapterError> {
+    let default_parent;
+    let parent = if let Some(path) = path {
+        if !path.is_absolute() {
+            return Err(AdapterError::Vault(
+                "the explicit vault storage parent must be an absolute path".to_owned(),
+            ));
+        }
+        path
+    } else {
+        default_parent = platform_vault_root()?;
+        &default_parent
+    };
+    default_requires_open_at(scope, parent)
 }
 
 fn platform_vault_root() -> Result<PathBuf, AdapterError> {
@@ -228,6 +247,72 @@ fn scoped_metadata_exists(root: &Path) -> Result<bool, AdapterError> {
         || path_is_file(&root.join(SCOPE_FILE))?
         || path_is_file(&root.join(INITIALIZED_FILE))?
         || path_is_file(&root.join(INITIALIZATION_LOCK))?)
+}
+
+fn default_requires_open_at(scope: Option<&str>, parent: &Path) -> Result<bool, AdapterError> {
+    if let Some(scope) = scope {
+        let identifier = scope_identifier(scope);
+        return scoped_requires_open(&parent.join(&identifier), &identifier);
+    }
+    let entries = match fs::read_dir(parent) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(storage_io(error)),
+    };
+    for entry in entries {
+        let entry = entry.map_err(storage_io)?;
+        let name = entry.file_name();
+        // Default vault directories are always named by a lowercase SHA-256.
+        if let Some(identifier) = name.to_str().filter(|name| {
+            name.len() == 64
+                && name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        }) && scoped_requires_open(&entry.path(), identifier)?
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn scoped_requires_open(root: &Path, identifier: &str) -> Result<bool, AdapterError> {
+    match fs::symlink_metadata(root) {
+        Ok(metadata) if !metadata.is_dir() => return Ok(true),
+        Ok(_) => reject_linked_directory(root)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(storage_io(error)),
+    }
+    // Only the exact files written before credential acquisition are safe to
+    // skip. State, records and any other evidence still require a normal open.
+    let mut has_lock = false;
+    let mut has_scope = false;
+    for entry in fs::read_dir(root).map_err(storage_io)? {
+        let entry = entry.map_err(storage_io)?;
+        if !entry.file_type().map_err(storage_io)?.is_file() {
+            return Ok(true);
+        }
+        match entry.file_name().to_str() {
+            Some(INITIALIZATION_LOCK) if entry.metadata().map_err(storage_io)?.len() == 0 => {
+                has_lock = true;
+            }
+            Some(SCOPE_FILE) => {
+                let mut marker = Vec::new();
+                File::open(entry.path())
+                    .map_err(storage_io)?
+                    .take(65)
+                    .read_to_end(&mut marker)
+                    .map_err(storage_io)?;
+                if marker != identifier.as_bytes() {
+                    return Ok(true);
+                }
+                has_scope = true;
+            }
+            _ => return Ok(true),
+        }
+    }
+    // Initialization always creates the lock before writing the scope marker.
+    Ok(has_scope && !has_lock)
 }
 
 fn valid_state_exists(root: &Path) -> Result<bool, AdapterError> {
@@ -594,7 +679,8 @@ mod tests {
     use zeroize::Zeroizing;
 
     use super::{
-        CredentialStore, DefaultVaultError, default_exists_with_base, open_default_with_store,
+        CredentialStore, DefaultVaultError, default_exists_with_base, default_requires_open,
+        open_default_with_store,
     };
     use crate::AdapterError;
 
@@ -912,6 +998,111 @@ mod tests {
             Err(AdapterError::StorageUnavailable(message))
                 if message == "operating-system credential store is unavailable"
         ));
+    }
+
+    #[test]
+    fn passive_default_open_skips_failed_initialization_and_allows_explicit_retry() {
+        let base = tempdir().expect("base directory");
+        let store = FakeCredentialStore {
+            read_only: true,
+            ..FakeCredentialStore::default()
+        };
+        let root = super::scoped_path(base.path(), "scope-a");
+        assert_eq!(
+            unavailable(open_default_with_store(
+                "scope-a",
+                None,
+                None,
+                base.path(),
+                &store
+            )),
+            "operating-system credential store is unavailable"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join(super::SCOPE_FILE)).expect("scope marker"),
+            super::scope_identifier("scope-a")
+        );
+        assert!(root.join(super::INITIALIZATION_LOCK).is_file());
+        assert!(!root.join(super::STATE_FILE).exists());
+        assert!(!root.join(super::INITIALIZED_FILE).exists());
+        for scope in [None, Some("scope-a")] {
+            assert!(default_exists_with_base(scope, None, base.path()).expect("metadata remains"));
+            assert!(!default_requires_open(scope, Some(base.path())).expect("passive probe"));
+        }
+        assert!(root.join(super::INITIALIZATION_LOCK).is_file());
+        assert!(root.join(super::SCOPE_FILE).is_file());
+        assert!(!root.join(super::STATE_FILE).exists());
+        assert!(!root.join(super::INITIALIZED_FILE).exists());
+
+        let reopen = || {
+            open_default_with_store(
+                "scope-a",
+                Some(base.path()),
+                Some(EXPLICIT_SECRET),
+                Path::new(""),
+                &store,
+            )
+            .expect("recover the original scope using an explicit key")
+        };
+        let value = br#"{"code":"synthetic"}"#;
+        reopen()
+            .store_value_map("tenant", "record", value)
+            .expect("write");
+        assert_eq!(
+            reopen()
+                .load_value_map("tenant", "record")
+                .expect("read")
+                .as_slice(),
+            value
+        );
+        for scope in [None, Some("scope-a")] {
+            assert!(default_requires_open(scope, Some(base.path())).expect("existing vault"));
+        }
+        assert_eq!(*store.writes.lock().expect("fake write lock"), 0);
+    }
+
+    #[test]
+    fn passive_default_open_skips_only_recognized_legacy_residue() {
+        let base = tempdir().expect("base directory");
+        let root = super::scoped_path(base.path(), "scope-a");
+        std::fs::create_dir(&root).expect("scope directory");
+        std::fs::create_dir(base.path().join("unrelated")).expect("foreign directory");
+        let check = |expected| {
+            for scope in [None, Some("scope-a")] {
+                assert_eq!(
+                    default_requires_open(scope, Some(base.path())).expect("probe"),
+                    expected
+                );
+            }
+        };
+        check(false);
+
+        let lock = root.join(super::INITIALIZATION_LOCK);
+        std::fs::write(&lock, b"").expect("legacy lock only");
+        check(false);
+        std::fs::remove_file(&lock).expect("remove fixture lock");
+        let scope = root.join(super::SCOPE_FILE);
+        std::fs::write(&scope, super::scope_identifier("scope-a")).expect("scope without lock");
+        check(true);
+        std::fs::write(&lock, b"").expect("restore expected first-write lock");
+        check(false);
+        std::fs::write(&scope, b"truncated").expect("ambiguous marker");
+        check(true);
+        std::fs::write(&scope, super::scope_identifier("scope-b")).expect("mismatched marker");
+        check(true);
+        std::fs::remove_file(&scope).expect("remove fixture marker");
+
+        for metadata in [super::STATE_FILE, super::INITIALIZED_FILE] {
+            let file = root.join(metadata);
+            std::fs::write(&file, b"").expect("state or initialization evidence");
+            check(true);
+            std::fs::remove_file(file).expect("remove fixture metadata");
+        }
+        let records = root.join("values");
+        std::fs::create_dir(&records).expect("record directory");
+        std::fs::write(records.join("orphan.pvm"), b"synthetic record").expect("orphan record");
+        check(true);
+        assert!(!default_requires_open(Some("scope-b"), Some(base.path())).expect("other scope"));
     }
 
     #[test]

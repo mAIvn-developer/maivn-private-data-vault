@@ -172,6 +172,23 @@ impl LocalVault {
             .map_err(python_error)
     }
 
+    /// Check for established or ambiguous storage without using credentials.
+    #[staticmethod]
+    #[pyo3(
+        signature = (scope=None, *, path=None),
+        text_signature = "(scope=None, *, path=None)"
+    )]
+    fn default_requires_open(
+        py: Python<'_>,
+        scope: Option<&str>,
+        path: Option<&str>,
+    ) -> PyResult<bool> {
+        let scope = scope.map(str::to_owned);
+        let path = path.map(PathBuf::from);
+        py.detach(move || default_vault::default_requires_open(scope.as_deref(), path.as_deref()))
+            .map_err(python_error)
+    }
+
     fn store_value_map(&self, tenant: &str, record: &str, payload: &[u8]) -> PyResult<()> {
         self.adapter
             .store_value_map(tenant, record, payload)

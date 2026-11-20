@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-11-19
+
+### Fixed
+- `LocalVault.default_requires_open(scope=None, *, path=None)` tells a vault that holds data, or whose state is unclear, from setup that was interrupted and left empty. It needs no credentials. maivn 2.8.1 uses it so that reading a thread no longer fails on leftover, empty vault setup; writes still open the vault normally.
+
 ## [0.1.1] - 2026-11-10
 
 ### Security

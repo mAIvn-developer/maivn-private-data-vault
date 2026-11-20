@@ -104,6 +104,12 @@ class LocalVault:
     def default_exists(scope: str | None = None, *, path: str | None = None) -> bool:
         """Check persisted vault metadata without reading or creating a credential."""
 
+    @staticmethod
+    def default_requires_open(
+        scope: str | None = None, *, path: str | None = None
+    ) -> bool:
+        """Check for established or ambiguous storage without using credentials."""
+
     def store_value_map(self, tenant: str, record: str, payload: bytes) -> None:
         """Seal a placeholder-to-value map, as UTF-8 JSON bytes."""
 
